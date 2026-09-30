@@ -5,8 +5,8 @@ Avenza - wallpaper animado para Windows (estilo Wallpaper Engine).
 Uma janela Qt é acoplada ao WorkerW do Windows, ficando atrás dos ícones da
 área de trabalho. O controle é feito por CLI e por um ícone na bandeja.
 
-Requisitos:  pip install PyQt6
-Uso:         python avenza.py --help
+Instalação:  na pasta do projeto, rode:  pip install -e .
+Uso:         avenza --help
 """
 from __future__ import annotations
 
@@ -262,7 +262,7 @@ def dispatch(cmd: str, args: dict) -> int:
             print("Parado.")
             return 0
         if cmd in DAEMON_ONLY:
-            print("O aplicativo não está em execução. Inicie com: avenza.py start")
+            print("O aplicativo não está em execução. Inicie com: avenza start")
             return 1
         r = config_command(Config(), cmd, args)
         if cmd in ("set", "next", "prev", "random") and r["ok"]:
@@ -308,9 +308,9 @@ def run_daemon() -> int:
         print("Avenza já está em execução.")
         return 0
 
-    from PyQt6.QtCore import QObject, QRect, Qt, QTimer, QUrl, pyqtSignal
-    from PyQt6.QtGui import (QActionGroup, QColor, QCursor, QFont, QIcon, QMovie,
-                             QPainter, QPixmap)
+    from PyQt6.QtCore import QObject, QPoint, QRect, Qt, QTimer, QUrl, pyqtSignal
+    from PyQt6.QtGui import (QActionGroup, QColor, QCursor, QFont, QGuiApplication, QIcon,
+                             QMovie, QPainter, QPixmap)
     from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
     from PyQt6.QtMultimediaWidgets import QVideoWidget
     from PyQt6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
@@ -332,6 +332,9 @@ def run_daemon() -> int:
     user32.SetParent.restype = HWND
     user32.GetParent.argtypes = [HWND]
     user32.GetParent.restype = HWND
+    user32.GetAncestor.argtypes = [HWND, UINT]
+    user32.GetAncestor.restype = HWND
+    user32.SetForegroundWindow.argtypes = [HWND]
     user32.IsWindow.argtypes = [HWND]
     user32.GetClientRect.argtypes = [HWND, ctypes.POINTER(wintypes.RECT)]
     user32.SetWindowPos.argtypes = [HWND, HWND, ctypes.c_int, ctypes.c_int,
@@ -380,7 +383,9 @@ def run_daemon() -> int:
     class WallpaperWindow(QWidget):
         def __init__(self):
             super().__init__()
-            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+                                | Qt.WindowType.WindowDoesNotAcceptFocus)
+            self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
             self.setGeometry(0, 0, 640, 360)
             self.kind = None
@@ -395,6 +400,9 @@ def run_daemon() -> int:
             self.player.setAudioOutput(self.audio)
             self.player.setVideoOutput(self.video)
             self.player.setLoops(QMediaPlayer.Loops.Infinite)
+            # O Qt pode descartar a taxa ao carregar/retomar a mídia: reaplica.
+            self.player.mediaStatusChanged.connect(lambda _: self._sync_rate())
+            self.player.playbackStateChanged.connect(lambda _: self._sync_rate())
 
         def set_fit(self, fit):
             self.fit = fit
@@ -410,6 +418,10 @@ def run_daemon() -> int:
         def set_audio(self, muted, volume):
             self.audio.setMuted(muted)
             self.audio.setVolume(volume / 100)
+
+        def _sync_rate(self):
+            if self.kind == "video" and abs(self.player.playbackRate() - self.speed) > 0.001:
+                self.player.setPlaybackRate(self.speed)
 
         def set_speed(self, rate):
             self.speed = rate
@@ -503,8 +515,6 @@ def run_daemon() -> int:
             self.tray = QSystemTrayIcon(make_icon(), app)
             self.tray.setToolTip(APP)
             self.menu = QMenu()
-            self.menu.aboutToShow.connect(self.populate)
-            self.tray.setContextMenu(self.menu)
             self.tray.activated.connect(self.on_tray)
             self.tray.show()
 
@@ -552,6 +562,8 @@ def run_daemon() -> int:
 
         def watchdog(self):
             """Reanexa se o Explorer reiniciar (o WorkerW é recriado)."""
+            if self.menu.isVisible():  # nunca mexe em janelas com o menu aberto
+                return
             hwnd = int(self.win.winId())
             if not user32.IsWindow(hwnd):
                 self.win.deleteLater()
@@ -561,7 +573,7 @@ def run_daemon() -> int:
             if self.win.isVisible() and (
                 not self.parent_hwnd
                 or not user32.IsWindow(self.parent_hwnd)
-                or user32.GetParent(hwnd) != self.parent_hwnd
+                or user32.GetAncestor(hwnd, 1) != self.parent_hwnd  # GA_PARENT
             ):
                 self.attach()
 
@@ -646,8 +658,28 @@ def run_daemon() -> int:
 
         # -- bandeja
         def on_tray(self, reason):
-            if reason == QSystemTrayIcon.ActivationReason.Trigger:
-                self.menu.popup(QCursor.pos())
+            R = QSystemTrayIcon.ActivationReason
+            if reason in (R.Trigger, R.Context):  # clique esquerdo ou direito
+                self.show_menu()
+
+        def show_menu(self):
+            """Abre o menu ancorado acima do ícone (cai para baixo só se não couber)."""
+            self.populate()
+            m = self.menu
+            size = m.sizeHint()
+            geo = self.tray.geometry()
+            cur = QCursor.pos()
+            anchor = geo if (geo.isValid() and not geo.isEmpty()) else QRect(cur.x(), cur.y(), 1, 1)
+            screen = QGuiApplication.screenAt(anchor.center()) or QGuiApplication.primaryScreen()
+            avail = screen.availableGeometry()
+            x = max(avail.left(), min(anchor.center().x() - size.width() // 2,
+                                      avail.right() - size.width()))
+            y = min(anchor.top(), avail.bottom()) - size.height()
+            if y < avail.top():  # barra no topo: sem espaço acima
+                y = max(anchor.bottom(), avail.top())
+            m.popup(QPoint(x, y))
+            m.activateWindow()
+            user32.SetForegroundWindow(int(m.winId()))  # fecha ao clicar fora
 
         def add_dialog(self):
             flt = "Mídia (" + " ".join("*" + e for e in sorted(MEDIA_EXT)) + ")"
